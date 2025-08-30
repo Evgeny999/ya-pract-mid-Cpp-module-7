@@ -1,7 +1,7 @@
 FROM ubuntu@sha256:79efa276fdefa2ee3911db29b0608f8c0561c347ec3f4d4139980d43b168d991
 
 # Update the package database and install required tools
-RUN apt update
+RUN apt update && apt upgrade -y
 RUN apt install -y python3 python3-pip pipx git less vim \
     sudo cmake make g++-15 libjemalloc-dev clang-format clangd-19 \
     gnuplot net-tools libasio-dev libboost-all-dev libgtest-dev \
