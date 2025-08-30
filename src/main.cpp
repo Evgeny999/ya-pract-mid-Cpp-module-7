@@ -3,6 +3,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/io_service.hpp>
 #include <boost/asio/read_until.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -20,10 +21,54 @@ using boost::asio::dynamic_buffer;
 using boost::asio::io_service;
 using boost::asio::transfer_at_least;
 using boost::asio::use_awaitable;
+using namespace boost::asio::experimental::awaitable_operators;
 using boost::asio::ip::tcp;
 using boost::system::error_code;
 
 constexpr std::string_view delimiter = "\r\n\r\n";
+// Подключаемся к серверу
+awaitable<tcp::socket> connectToTarget(io_service &io_service, const std::string &host, const std::string &port) {
+    unsigned short port_num = static_cast<unsigned short>(std::stoi(port));
+
+    boost::asio::ip::address address = boost::asio::ip::address::from_string(host);
+    tcp::endpoint endpoint(address, port_num);
+
+    tcp::socket target_socket(io_service);
+    co_await target_socket.async_connect(endpoint, use_awaitable);
+
+    co_return target_socket;
+}
+// Передача данных между клиентом и сервером
+awaitable<void> forwardData(tcp::socket &from, tcp::socket &to, const std::string &direction) {
+    try {
+        std::string buffer(4096, '\0');
+
+        while (true) {
+            error_code ec;
+            std::size_t bytes_read = co_await from.async_read_some(boost::asio::buffer(buffer),
+                                                                   boost::asio::redirect_error(use_awaitable, ec));
+            auto contentLength = findContentLength(buffer);
+            if (contentLength.has_value()) {
+                std::println("Content-Length detected: {} bytes", contentLength.value());
+            }
+
+            if (ec == boost::asio::error::eof) {
+                // Graceful connection closure
+                std::println("{} connection closed gracefully", direction);
+                break;
+            } else if (ec) {
+                // Other error
+                throw boost::system::system_error(ec);
+            }
+
+            co_await async_write(to, boost::asio::buffer(buffer, bytes_read), use_awaitable);
+            std::println("{} forwarded {} bytes", direction, bytes_read);
+        }
+    } catch (const std::exception &e) {
+        std::println("Forwarding error ({}): {}", direction, e.what());
+        throw;  // Re-throw to cancel the other direction
+    }
+}
 
 awaitable<void> session(tcp::socket client_socket, io_service &io_service) {
     std::string client_id = "unknown";
@@ -34,13 +79,24 @@ awaitable<void> session(tcp::socket client_socket, io_service &io_service) {
                                 client_socket.remote_endpoint().port());
         log("Client connected");
         try {
-            for (;;) {
-                std::size_t n = co_await async_read_until(client_socket, dynamic_buffer(buf), '\n', use_awaitable);
-                co_await async_write(client_socket, buffer(buf, n), use_awaitable);
-                buf.erase(0, n);
+            /*std::size_t n = */ co_await async_read_until(client_socket, dynamic_buffer(buf), '\n', use_awaitable);
+            // std::println("buf = {}", buf);
+            // Нужно взять ip сервера и tcp порт из запроса клиента
+            auto [host, port] = findHostPort(buf);
+            log(std::format("Connecting to target: {}:{}", host, port));
 
-                log(std::format("Echoed {} bytes to client", n));
-            }
+            std::println("host = '{}'", host);
+            std::println("port = '{}'", port);
+
+            // Connect to target server
+            tcp::socket target_socket = co_await connectToTarget(io_service, host, port);
+
+            log("Connected to target server");
+
+            // Запускаем передачу запросов между клиентом и сервером
+            co_await (forwardData(client_socket, target_socket, "Client→Target") ||
+                      forwardData(target_socket, client_socket, "Target→Client"));
+            log("Session completed");
         } catch (const boost::system::system_error &e) {
             if (e.code() == boost::asio::error::eof) {
                 log("Client closed connection gracefully");
